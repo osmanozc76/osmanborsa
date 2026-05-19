@@ -2,8 +2,9 @@ streamlit
 pandas
 numpy
 plotly
-curl-cffi
+curl_cffi
 scikit-learn
-yfinance
-requests
-ta
+xgboost
+lightgbm
+catboost
+shap
