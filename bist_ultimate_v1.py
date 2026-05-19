@@ -685,11 +685,11 @@ def train_ensemble(df: pd.DataFrame):
     # ── XGBoost ──
     try:
         xg = xgb.XGBClassifier(
-            n_estimators=300, max_depth=3, learning_rate=0.03,
+            n_estimators=100, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.7,
             reg_alpha=0.5, reg_lambda=2.0,
             eval_metric="logloss",
-            early_stopping_rounds=20, verbosity=0, n_jobs=1,
+            early_stopping_rounds=15, verbosity=0, n_jobs=1,
         )
         xg.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
         models["xgb"] = xg
@@ -699,14 +699,14 @@ def train_ensemble(df: pd.DataFrame):
     # ── LightGBM ──
     try:
         lg = lgb.LGBMClassifier(
-            n_estimators=300, max_depth=3, learning_rate=0.03,
+            n_estimators=100, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.7,
             min_child_samples=20, reg_alpha=0.5, reg_lambda=2.0,
             verbosity=-1, n_jobs=1,
         )
         lg.fit(X_tr, y_tr,
                eval_set=[(X_va, y_va)],
-               callbacks=[lgb.early_stopping(20, verbose=False),
+               callbacks=[lgb.early_stopping(15, verbose=False),
                           lgb.log_evaluation(-1)])
         models["lgbm"] = lg
     except Exception:
@@ -715,8 +715,8 @@ def train_ensemble(df: pd.DataFrame):
     # ── CatBoost ──
     try:
         cat = CatBoostClassifier(
-            iterations=300, depth=3, learning_rate=0.03,
-            l2_leaf_reg=4.0, early_stopping_rounds=20,
+            iterations=100, depth=3, learning_rate=0.05,
+            l2_leaf_reg=4.0, early_stopping_rounds=15,
             eval_set=(X_va, y_va), verbose=False,
         )
         cat.fit(X_tr, y_tr)
@@ -1565,7 +1565,7 @@ st.sidebar.markdown(f"**{mkt_desc}**  •  {mkt_time} TR")
 st.sidebar.markdown("---")
 
 index_trend   = st.sidebar.selectbox("XU100 Endeks Yönü", ["POZİTİF","NEGATİF"], index=0)
-use_ai        = st.sidebar.checkbox("🤖 Ensemble AI Motor (sklearn gerekli)", value=SKLEARN_AVAILABLE)
+use_ai        = st.sidebar.checkbox("🤖 Ensemble AI Motor (sklearn gerekli)", value=False)
 auto_refresh  = st.sidebar.checkbox("⏱️ 5 Dakikada Bir Yenile", value=False)
 
 st.sidebar.markdown("---")
