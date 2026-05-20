@@ -20,12 +20,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-try:
-    from curl_cffi import requests as cffi_requests
-    CURL_CFFI_AVAILABLE = True
-except ImportError:
-    import requests as cffi_requests
-    CURL_CFFI_AVAILABLE = False
+from curl_cffi import requests as cffi_requests
 from datetime import datetime, timedelta
 import warnings
 import os
@@ -270,7 +265,7 @@ def show_table(df, score_col=None):
 # ─────────────────────────────────────────────────────────────────────
 # AYARLAR & KONFİGÜRASYON
 # ─────────────────────────────────────────────────────────────────────
-CACHE_DIR           = os.path.join(os.environ.get("HOME", "/tmp"), "bist_cache")
+CACHE_DIR           = "data_cache"
 CACHE_STALE_SECONDS = 3600
 PORTFOLIO_FILE      = os.path.join(CACHE_DIR, "portfolio.json")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -359,10 +354,7 @@ def fetch_yahoo_chart(symbol: str, period: str = "1y", interval: str = "1d") -> 
            f"?range={y_range}&interval={y_interval}")
     time.sleep(random.uniform(0.15, 0.5))
     try:
-        kwargs = {"headers": HEADERS, "timeout": 14}
-        if CURL_CFFI_AVAILABLE:
-            kwargs["impersonate"] = "chrome"
-        resp = cffi_requests.get(url, **kwargs)
+        resp = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=14)
         if resp.status_code != 200: return pd.DataFrame()
         data   = resp.json()
         result = data.get("chart", {}).get("result", [])
@@ -438,10 +430,7 @@ def _fetch_ticker_info(sym: str) -> dict:
     url = (f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{sym}"
            f"?modules=defaultKeyStatistics,summaryDetail")
     try:
-        kwargs = {"headers": HEADERS, "timeout": 10}
-        if CURL_CFFI_AVAILABLE:
-            kwargs["impersonate"] = "chrome"
-        resp = cffi_requests.get(url, **kwargs)
+        resp = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=10)
         if resp.status_code != 200: return {}
         data   = resp.json()
         result = data.get("quoteSummary", {}).get("result", [])
@@ -473,10 +462,7 @@ def fetch_news(sym=None, count=10) -> list:
     try:
         q   = sym if sym else "BIST borsa"
         url = f"https://query1.finance.yahoo.com/v1/finance/search?q={q}&newsCount={count}&quotesCount=0"
-        kwargs = {"headers": HEADERS, "timeout": 10}
-        if CURL_CFFI_AVAILABLE:
-            kwargs["impersonate"] = "chrome"
-        resp = cffi_requests.get(url, **kwargs)
+        resp = cffi_requests.get(url, headers=HEADERS, impersonate="chrome", timeout=10)
         if resp.status_code != 200: return []
         news = resp.json().get("news", [])
         return [{
@@ -632,110 +618,50 @@ FEATURE_COLS = [
 ]
 
 def build_target(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    5 günlük +%5 geriye dönük momentum etiketi — LOOK-AHEAD BIAS YOK.
-
-    Eski yöntem (shift(-5)) gelecek fiyatı kullanıyordu → veri sızıntısı.
-    Yeni yöntem: t anında t-5..t aralığındaki geçmiş maksimum kâr fırsatını
-    etiket olarak kullanır.  Model yalnızca t anında mevcut olan bilgiyle
-    eğitilir; gelecek fiyat hiçbir şekilde feature veya label hesabına girmez.
-    """
+    """5 günlük +%5 hedef etiketi."""
     df = df.copy()
-    # Geçmiş 5 günlük penceredeki maksimum kapanış (t dahil, t-4..t)
-    past_max = df["Close"].rolling(5).max()
-    # 5 gün önce kapanış fiyatına göre o pencerede %5 kâr yakalandı mı?
-    df["TARGET"] = (past_max >= df["Close"].shift(4) * 1.05).astype(int)
-    # İlk 4 satır NaN olur (rolling penceresi dolmadan), temizle
+    future_max = df["Close"].shift(-5).rolling(5).max()
+    df["TARGET"] = (future_max >= df["Close"] * 1.05).astype(int)
     return df.dropna(subset=["TARGET"])
 
 
 def train_ensemble(df: pd.DataFrame):
-    """
-    XGB + LGBM + CatBoost + RF ensemble eğit.
-
-    OVERFİTTİNG DÜZELTMELERİ:
-    1. Walk-forward split: eğitim penceresi zaman sırasına göre ayrılır,
-       test kümesi eğitim setinin SONRASINDAKI verilerden oluşur.
-    2. Erken durdurma (early stopping) XGB ve LGBM'de aktif → validation
-       setine göre durur, ezberleme önlenir.
-    3. Regularizasyon parametreleri güçlendirildi (reg_alpha, reg_lambda,
-       min_child_samples, subsample, colsample_bytree).
-    4. Modeller yalnızca tek hisseden değil, dışarıdan geçilen birleşik
-       DataFrame üzerinde eğitilir (çoklu hisse havuzu için bkz. ana döngü).
-    """
-    if not SKLEARN_AVAILABLE or len(df) < 120:
+    """XGB + LGBM + CatBoost + RF ensemble eğit. Yoksa None döner."""
+    if not SKLEARN_AVAILABLE or len(df) < 100:
         return None
-
     X = df[FEATURE_COLS].copy().fillna(0)
     y = df["TARGET"]
-
-    # Walk-forward split: ilk %70 eğitim, sonraki %15 validation, son %15 test
-    n     = len(df)
-    tr_end = int(n * 0.70)
-    va_end = int(n * 0.85)
-
-    X_tr, y_tr = X.iloc[:tr_end],       y.iloc[:tr_end]
-    X_va, y_va = X.iloc[tr_end:va_end], y.iloc[tr_end:va_end]
-
-    if len(X_tr) < 60 or len(X_va) < 15:
-        return None
-
+    split = int(len(df) * 0.8)
+    X_tr, y_tr = X.iloc[:split], y.iloc[:split]
     models = {}
-
-    # ── XGBoost ──
     try:
-        xg = xgb.XGBClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.7,
-            reg_alpha=0.5, reg_lambda=2.0,
-            eval_metric="logloss",
-            early_stopping_rounds=15, verbosity=0, n_jobs=1,
-        )
-        xg.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        xg = xgb.XGBClassifier(n_estimators=80, max_depth=4, learning_rate=0.05,
+                                 use_label_encoder=False, eval_metric="logloss",
+                                 verbosity=0, n_jobs=1)
+        xg.fit(X_tr, y_tr)
         models["xgb"] = xg
     except Exception:
         pass
-
-    # ── LightGBM ──
     try:
-        lg = lgb.LGBMClassifier(
-            n_estimators=100, max_depth=3, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.7,
-            min_child_samples=20, reg_alpha=0.5, reg_lambda=2.0,
-            verbosity=-1, n_jobs=1,
-        )
-        lg.fit(X_tr, y_tr,
-               eval_set=[(X_va, y_va)],
-               callbacks=[lgb.early_stopping(15, verbose=False),
-                          lgb.log_evaluation(-1)])
+        lg = lgb.LGBMClassifier(n_estimators=80, max_depth=4, learning_rate=0.05,
+                                  verbosity=-1, n_jobs=1)
+        lg.fit(X_tr, y_tr)
         models["lgbm"] = lg
     except Exception:
         pass
-
-    # ── CatBoost ──
     try:
-        cat = CatBoostClassifier(
-            iterations=100, depth=3, learning_rate=0.05,
-            l2_leaf_reg=4.0, early_stopping_rounds=15,
-            eval_set=(X_va, y_va), verbose=False,
-        )
+        cat = CatBoostClassifier(iterations=80, depth=4, learning_rate=0.05,
+                                  verbose=False)
         cat.fit(X_tr, y_tr)
         models["cat"] = cat
     except Exception:
         pass
-
-    # ── Random Forest (calibrate edilmiş) ──
     try:
-        rf_base = RandomForestClassifier(
-            n_estimators=100, max_depth=4, min_samples_leaf=10,
-            max_features=0.6, n_jobs=1, random_state=42,
-        )
-        rf = CalibratedClassifierCV(rf_base, cv=3, method="isotonic")
+        rf = RandomForestClassifier(n_estimators=60, max_depth=5, n_jobs=1, random_state=42)
         rf.fit(X_tr, y_tr)
         models["rf"] = rf
     except Exception:
         pass
-
     return models if models else None
 
 
@@ -872,105 +798,52 @@ def run_backtest(sym: str, df: pd.DataFrame,
                  capital: float = 100_000.0,
                  comm: float = 0.0005,
                  slip: float = 0.0005):
-    """
-    Backtest motoru — LOOK-AHEAD BIAS YOK.
-
-    Eski versiyonda her çubukta tüm DataFrame'deki göstergeler (EMA50 vb.)
-    zaten hesaplanmış halde geliyordu; bu göstergeler o çubuğun ÖTESİNDEKİ
-    fiyatları da kullanarak hesaplanmıştı → geleceğe bakış.
-
-    Düzeltme:
-    • Göstergeler her i adımında YALNIZCA df.iloc[:i+1] alt kümesiyle
-      hesaplanır (expanding window).  Bu, gerçek zamanlı uygulamayı taklit eder.
-    • Signal sadece i anında mevcut olan bilgiye dayanır.
-    • Pozisyon açma/kapama fiyatı bir sonraki çubuğun açılış fiyatıdır
-      (gerçekçi uygulama — çubuğun kapanışında sinyal bilmek ama
-      o fiyattan girmek mümkün değildir).
-    """
-    if df is None or len(df) < 40:
-        return None
-
-    bt     = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    cap    = capital
-    pos    = 0
-    ep     = sl = hp = ps = 0.0
-    ed     = None
-    trades = []
-    eq     = [capital]
-
-    for i in range(20, len(bt) - 1):   # -1: giriş/çıkış bir sonraki çubukta
-        # ── SADECE geçmiş veriyi kullan (i+1 dahil değil) ──
-        window = bt.iloc[:i + 1].copy()
-
-        # Göstergeleri bu pencerede yeniden hesapla
-        cl   = window["Close"]
-        ema9  = cl.ewm(span=9,  adjust=False).mean().iloc[-1]
-        ema21 = cl.ewm(span=21, adjust=False).mean().iloc[-1]
-        ema50 = cl.ewm(span=50, adjust=False).mean().iloc[-1]
-
-        delta = cl.diff()
-        gain  = delta.where(delta > 0, 0).rolling(14).mean()
-        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi   = (100 - (100 / (1 + gain / (loss + 1e-9)))).iloc[-1]
-
-        e12  = cl.ewm(span=12, adjust=False).mean()
-        e26  = cl.ewm(span=26, adjust=False).mean()
-        macd_hist = ((e12 - e26) - (e12 - e26).ewm(span=9, adjust=False).mean()).iloc[-1]
-
-        tr_s = pd.concat([
-            window["High"] - window["Low"],
-            (window["High"] - window["Close"].shift()).abs(),
-            (window["Low"]  - window["Close"].shift()).abs(),
-        ], axis=1).max(axis=1)
-        atr = tr_s.rolling(14).mean().iloc[-1]
-        if np.isnan(atr) or atr <= 0:
-            atr = window["Close"].iloc[-1] * 0.02
-
-        cur_close = window["Close"].iloc[-1]
-
-        # ── Basit kural tabanlı sinyal (i anındaki bilgiyle) ──
-        ts  = 50 + (25 if ema9 > ema21 else -25) + (25 if macd_hist > 0 else -25)
-        os_ = 50 + (25 if rsi < 30 else (-25 if rsi > 70 else 0))
-        sc  = int(ts * 0.6 + os_ * 0.4)
+    if df is None or len(df) < 40: return None
+    bt      = df.copy()
+    cap     = capital
+    pos     = 0
+    ep      = sl = hp = ps = 0.0
+    ed      = None
+    trades  = []
+    eq      = [capital]
+    for i in range(20, len(bt)):
+        cr, pr = bt.iloc[i], bt.iloc[i - 1]
+        cd     = bt.index[i]
+        itr    = "POZİTİF" if cr["Close"] > cr.get("EMA50", cr["Close"]) else "NEGATİF"
+        reg    = detect_regime_hisse(bt.iloc[:i+1])
+        # basit kural skoru (AI modeli yokken)
+        ts = 50 + (25 if cr.get("EMA9", cr["Close"]) > cr.get("EMA21", cr["Close"]) else -25) \
+                + (25 if cr.get("MACD_Hist", 0) > 0 else -25)
+        os_ = 50 + (25 if cr.get("RSI", 50) < 30 else (-25 if cr.get("RSI", 50) > 70 else 0))
+        sc  = int((ts * 0.6 + os_ * 0.4))
         sig = "AL" if sc >= 60 else ("SAT" if sc <= 40 else "TUT")
-
-        # ── Bir sonraki çubuğun fiyatlarıyla işlem yap ──
-        next_row = bt.iloc[i + 1]
-        cd       = bt.index[i + 1]
-        exec_open = float(next_row["Open"])   # gerçekçi: signal sonraki açılışta uygulanır
-
         if pos == 1:
-            if cur_close > hp:
-                hp  = cur_close
-                nsl = hp - 2.0 * atr
-                if nsl > sl:
-                    sl = nsl
-            # Stop kontrol: sonraki çubuğun low'una göre
-            if float(next_row["Low"]) <= sl or sig == "SAT":
-                xp  = (sl if float(next_row["Low"]) <= sl else exec_open) * (1 - slip)
-                fee = xp * ps * comm
-                cap = ps * xp - fee
+            if cr["High"] > hp:
+                hp  = cr["High"]
+                nsl = hp - 2.0 * cr.get("ATR", cr["Close"] * 0.02)
+                if nsl > sl: sl = nsl
+            if cr["Low"] <= sl or sig == "SAT":
+                xp   = (sl if cr["Low"] <= sl else cr["Close"]) * (1 - slip)
+                fee  = xp * ps * comm
+                cap  = ps * xp - fee
                 trades.append({
                     "Hisse": sym, "Giriş": str(ed.date()), "Çıkış": str(cd.date()),
                     "Giriş (TL)": round(ep, 2), "Çıkış (TL)": round(xp, 2),
-                    "Tip": "SL" if float(next_row["Low"]) <= sl else "SIG",
+                    "Tip": "SL" if cr["Low"] <= sl else "SIG",
                     "Kâr/Zarar": round((xp - ep) * ps - fee, 2),
-                    "Getiri (%)": round((xp - ep) / (ep + 1e-9) * 100, 2),
+                    "Getiri (%)": round((xp - ep) / ep * 100, 2),
                 })
                 pos = ps = 0.0
-
         elif pos == 0 and sig == "AL":
-            ep  = exec_open * (1 + slip)
+            ep  = cr["Close"] * (1 + slip)
             ed  = cd
             cap -= cap * comm
-            ps  = cap / (ep + 1e-9)
+            ps  = cap / ep
             cap = 0.0
             pos = 1
-            hp  = exec_open
-            sl  = ep - 2.0 * atr
-
-        eq.append(ps * cur_close if pos == 1 else cap)
-
+            hp  = cr["Close"]
+            sl  = ep - 2.0 * cr.get("ATR", ep * 0.02)
+        eq.append(ps * cr["Close"] if pos == 1 else cap)
     tdf  = pd.DataFrame(trades)
     eq_s = pd.Series(eq)
     mdd  = ((eq_s - eq_s.cummax()) / (eq_s.cummax() + 1e-9)).min() * 100
@@ -1565,7 +1438,7 @@ st.sidebar.markdown(f"**{mkt_desc}**  •  {mkt_time} TR")
 st.sidebar.markdown("---")
 
 index_trend   = st.sidebar.selectbox("XU100 Endeks Yönü", ["POZİTİF","NEGATİF"], index=0)
-use_ai        = st.sidebar.checkbox("🤖 Ensemble AI Motor (sklearn gerekli)", value=False)
+use_ai        = st.sidebar.checkbox("🤖 Ensemble AI Motor (sklearn gerekli)", value=SKLEARN_AVAILABLE)
 auto_refresh  = st.sidebar.checkbox("⏱️ 5 Dakikada Bir Yenile", value=False)
 
 st.sidebar.markdown("---")
@@ -1598,59 +1471,29 @@ status   = st.empty()
 xu100_df = fetch_market_data("XU100.IS", "1y", "1d")
 usd_df   = fetch_market_data("TRY=X",    "1y", "1d")
 
-# ── OVERFİTTİNG DÜZELTMESİ: Çoklu hisse havuzuyla eğitim ──
-# Eski yöntem: sadece ilk başarılı hisseden eğitim → tek sembolde overfitting.
-# Yeni yöntem: ilk geçiş tüm hisselerin verisini toplar, ikinci geçiş modeli
-# bu birleşik havuzdan eğitir → model birden fazla enstrümanın paternini öğrenir.
-global_models   = None
-raw_cache: dict = {}   # sembol → ham DataFrame (ikinci geçişte tekrar fetch yok)
+# Opsiyonel AI modeli (ilk hisseden eğit, diğerlerine uygula)
+global_models = None
 
-status.text("⚡ Veri hazırlanıyor...")
-
-# Birinci geçiş: veri çek ve önbelleğe al
 for idx, sym in enumerate(hisseler):
-    status.text(f"📥 Veri çekiliyor: {sym}  ({idx+1}/{len(hisseler)})")
+    status.text(f"⚡ Taranıyor: {sym}  ({idx+1}/{len(hisseler)})")
     raw_df = fetch_market_data(sym, "1y", "1d")
     if not raw_df.empty and len(raw_df) >= 50:
-        raw_cache[sym] = raw_df
-    progress.progress((idx + 1) / len(hisseler) * 0.5)   # ilk %50
-
-# Ensemble AI eğitimi — birleşik hisse havuzu
-if use_ai and SKLEARN_AVAILABLE and raw_cache:
-    status.text("🤖 Ensemble AI eğitiliyor (çoklu hisse havuzu)...")
-    frames = []
-    for sym, raw_df in raw_cache.items():
-        try:
-            df_tmp = raw_df.copy()
-            df_tmp.columns = [str(c).strip().title() for c in df_tmp.columns]
-            df_tmp = calculate_indicators(df_tmp)
-            df_tmp = build_target(df_tmp)
-            df_tmp.dropna(subset=FEATURE_COLS + ["TARGET"], inplace=True)
-            if len(df_tmp) >= 80:
-                frames.append(df_tmp)
-        except Exception:
-            pass
-    if frames:
-        # Birden fazla hisse varsa birleştir; zaman sırasını bozma
-        if len(frames) >= 3:
-            combined = pd.concat(frames).sort_index()
-        else:
-            combined = frames[0]
-        if len(combined) >= 120:
+        # İlk başarılı veriyle AI modelini eğit
+        if use_ai and SKLEARN_AVAILABLE and global_models is None:
             try:
-                global_models = train_ensemble(combined)
+                df_tmp = raw_df.copy()
+                df_tmp.columns = [str(c).strip().title() for c in df_tmp.columns]
+                df_tmp = calculate_indicators(df_tmp)
+                df_tmp = build_target(df_tmp)
+                df_tmp.dropna(subset=FEATURE_COLS + ["TARGET"], inplace=True)
+                if len(df_tmp) >= 100:
+                    global_models = train_ensemble(df_tmp)
             except Exception:
-                global_models = None
-
-# İkinci geçiş: analiz
-for idx, sym in enumerate(hisseler):
-    status.text(f"⚡ Analiz ediliyor: {sym}  ({idx+1}/{len(hisseler)})")
-    raw_df = raw_cache.get(sym)
-    if raw_df is not None:
+                pass
         res = analyze(sym, raw_df, global_models, xu100_df, usd_df, index_trend)
         if res:
             results.append(res)
-    progress.progress(0.5 + (idx + 1) / len(hisseler) * 0.5)   # son %50
+    progress.progress((idx + 1) / len(hisseler))
 
 status.empty()
 progress.empty()
